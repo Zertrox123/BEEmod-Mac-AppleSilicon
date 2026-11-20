@@ -1,0 +1,315 @@
+diff --git a/docs/puzzlemaker.md b/docs/puzzlemaker.md
+index f38c1ff..b01a970 100644
+--- a/docs/puzzlemaker.md
++++ b/docs/puzzlemaker.md
+@@ -48,3 +48,46 @@ signal until the guest next polls, invokes the registered guest handler, and
+ restores the CPU registers. The game handler reaps the compiler and records its
+ exit status. Process completion also invalidates parent overlay lookups after
+ external writes.
++
++## Custom map compiler hook
++
++If `~/Library/Application Support/Portal 2 Natif/map-compiler-hook` exists and
++is executable, the app launcher exports `P2_MAP_COMPILER` to it and
++`P2_NATIVE_MAP_COMPILER` to the bundled `portal2-map-compiler`. The hook
++receives the native compiler's arguments (`--images ... --program P -- <tool
++arguments>`) and decides what to run. Without the file, nothing changes.
++
++Plain relative search paths in `portal2/gameinfo.txt` (such as `Game "BEE2"`)
++resolve from the executable's directory, which is `bin/` here, not the game
++root. `tools/puzzlemaker.py` rewrites them to `|gameinfo_path|../NAME` in the
++user-data copy when a folder of that name exists in the game root.
++
++## BEEmod
++
++BEEmod (BEE2.4) 4.36 is the last release with a macOS build (Intel, runs under
++Rosetta). With `tools/beemod_map_compiler_hook.sh` installed as the hook above,
++Build and Play and publishing work with BEEmod items:
++
++1. Download `BEE2_4.36.0_mac_old.zip` and `BEE2_v4.36.0_packages_old.zip` from
++   the BEEmod releases and unzip both into one folder; `chmod +x` `BEE2`,
++   `compiler/vbsp_osx` and `compiler/vrad_osx`.
++2. Its Tk 8.6.8 draws empty windows on current macOS, and Tk 8.6.16 loops in
++   `update` while the window is built. Tk 8.6.10 works: from the python.org
++   `python-3.9.1-macos11.0.pkg` (expanded with `pkgutil --expand-full`, not
++   installed), take the x86_64 slices of `libtcl8.6.dylib` and
++   `libtk8.6.dylib` (`lipo -thin x86_64`, `install_name_tool -id
++   @loader_path/...`, `codesign -s -`), and replace BEEmod's `tcl/` and `tk/`
++   with `tcl8.6/` and `tk8.6/`; also copy `tcl8/` next to them (msgcat, needed
++   when started from Finder).
++3. Its game picker only accepts `.exe` files: write
++   `~/Library/Preferences/BEEMOD2/config/games.cfg` by hand, with
++   `SteamID = 620` and `Dir =` the Steam `Portal 2` folder.
++4. Quit the game, export from BEEmod, start Portal 2 Natif.
++
++The hook runs BEEmod's `bin/vbsp_osx` and `bin/vrad_osx`, which call back
++`bin/vbsp_osx_original` and `vrad_osx_original`: symlinks to the hook, which
++runs the native compiler. It translates the map path between the game folder
++and the user-data layer, and links `portal2/puzzles` and `portal2/screenshots`
++to user data for BEEmod's VRAD. Log: `~/Library/Logs/Portal2Natif-compiler.log`.
++BEEmod writes into the Steam folder: "Verify integrity of game files" undoes
++its export.
+diff --git a/tests/test_puzzlemaker.py b/tests/test_puzzlemaker.py
+new file mode 100644
+index 0000000..5ea4e12
+--- /dev/null
++++ b/tests/test_puzzlemaker.py
+@@ -0,0 +1,56 @@
++import importlib.util
++from pathlib import Path
++import tempfile
++import unittest
++
++REPO = Path(__file__).resolve().parents[1]
++spec = importlib.util.spec_from_file_location('puzzlemaker', REPO / 'tools/puzzlemaker.py')
++puzzlemaker = importlib.util.module_from_spec(spec)
++spec.loader.exec_module(puzzlemaker)
++
++GAMEINFO = b'''"GameInfo"
++{
++\tgame \t\t"PORTAL 2"
++\tFileSystem
++\t{
++\t\tSearchPaths
++\t\t{
++\t\t\tGame\t\t\t\t|gameinfo_path|.
++\t\t\tGame\t"BEE2"
++\t\t\tGame\tmissing_folder
++\t\t}
++\t}
++}
++'''
++
++
++class PuzzleMakerTests(unittest.TestCase):
++    def setUp(self):
++        directory = tempfile.TemporaryDirectory()
++        self.addCleanup(directory.cleanup)
++        self.game = Path(directory.name) / 'game'
++        self.user = Path(directory.name) / 'user'
++        (self.game / 'portal2').mkdir(parents=True)
++        (self.game / 'bee2').mkdir()
++        (self.game / 'portal2/gameinfo.txt').write_bytes(GAMEINFO)
++
++    def test_relative_game_path_is_anchored_to_the_game_root(self):
++        out = puzzlemaker.anchor_relative_game_paths(GAMEINFO, self.game)
++        self.assertIn(b'\t\t\tGame\t|gameinfo_path|../bee2\n', out)
++
++    def test_other_lines_are_kept(self):
++        out = puzzlemaker.anchor_relative_game_paths(GAMEINFO, self.game)
++        self.assertIn(b'\tgame \t\t"PORTAL 2"\n', out)
++        self.assertIn(b'Game\t\t\t\t|gameinfo_path|.\n', out)
++        self.assertIn(b'Game\tmissing_folder\n', out)
++
++    def test_user_copy_has_sdk_content_and_anchored_path(self):
++        puzzlemaker.prepare_puzzlemaker(self.game, self.user)
++        out = (self.user / 'portal2/gameinfo.txt').read_bytes()
++        self.assertIn(b'SDKCONTENT\t\t|gameinfo_path|../sdk_content', out)
++        self.assertIn(b'|gameinfo_path|../bee2', out)
++        self.assertTrue((self.user / 'sdk_content/maps').is_dir())
++
++
++if __name__ == '__main__':
++    unittest.main()
+diff --git a/tools/beemod_map_compiler_hook.sh b/tools/beemod_map_compiler_hook.sh
+new file mode 100755
+index 0000000..90dc304
+--- /dev/null
++++ b/tools/beemod_map_compiler_hook.sh
+@@ -0,0 +1,114 @@
++#!/bin/bash
++# Map compiler hook for BEEmod (BEE2.4) 4.36, the last release with a macOS
++# build (Intel, runs under Rosetta).
++#
++# Install: copy this file to
++#   ~/Library/Application Support/Portal 2 Natif/map-compiler-hook
++# and make it executable. The app launcher then exports P2_MAP_COMPILER to it
++# and P2_NATIVE_MAP_COMPILER to the bundled portal2-map-compiler.
++#
++# The game calls:  hook --images I --game-dir G --linux-root L --user-dir U --program P -- <args>
++# Without a BEEmod export in G/bin, everything goes straight to the native
++# compiler. With one, VBSP and VRAD go through BEEmod's macOS compilers
++# (G/bin/vbsp_osx and vrad_osx). Those call back G/bin/vbsp_osx_original and
++# vrad_osx_original: symlinks to this script, which then runs the native
++# compiler.
++#
++# Files written by the game (preview.vmf, preview.bsp...) live in the user
++# layer U; the native compiler sees them under G. Paths are translated G -> U
++# for BEEmod and U -> G for the native compiler.
++
++LOG="$HOME/Library/Logs/Portal2Natif-compiler.log"
++log() { echo "[hook $(date '+%T')] $*" >>"$LOG"; }
++
++self_name=$(basename "$0")
++case "$self_name" in
++    vbsp_osx_original|vrad_osx_original) MODE=original ;;
++    *) MODE=hook ;;
++esac
++
++if [ "$MODE" = hook ]; then
++    FIXED=()
++    while [ $# -gt 0 ]; do
++        case "$1" in
++            --images) FIXED+=("$1" "$2"); shift 2 ;;
++            --game-dir) GAME=$2; FIXED+=("$1" "$2"); shift 2 ;;
++            --linux-root) FIXED+=("$1" "$2"); shift 2 ;;
++            --user-dir) USERDIR=$2; FIXED+=("$1" "$2"); shift 2 ;;
++            --program) PROGRAM=$2; shift 2 ;;
++            --) shift; break ;;
++            *) break ;;
++        esac
++    done
++    { echo "=== $(date '+%F %T') program=$PROGRAM cwd=$PWD"; printf '%q ' "$@"; echo; } >>"$LOG"
++    # Passed down to the "original" mode called by BEEmod.
++    export P2_HOOK_FIXED_ARGS=$(printf '%q ' "${FIXED[@]}")
++    export P2_HOOK_GAME="$GAME" P2_HOOK_USER="$USERDIR"
++else
++    GAME=$P2_HOOK_GAME; USERDIR=$P2_HOOK_USER
++    eval "FIXED=($P2_HOOK_FIXED_ARGS)"
++    case "$self_name" in vbsp_osx_original) PROGRAM=vbsp_linux ;; *) PROGRAM=vrad_dll.so ;; esac
++    log "original $PROGRAM: $(printf '%q ' "$@")"
++fi
++
++NATIVE=${P2_NATIVE_MAP_COMPILER:?P2_NATIVE_MAP_COMPILER is not set}
++
++# Game path (G/...) -> real file: the user layer if it is there.
++to_host() {
++    local p=$1 rel
++    case "$p" in
++        "$GAME"/*) rel=${p#"$GAME"/}
++            if [ -e "$USERDIR/$rel" ] || [ -e "$USERDIR/$rel.vmf" ]; then echo "$USERDIR/$rel"; else echo "$p"; fi ;;
++        *) echo "$p" ;;
++    esac
++}
++# User layer file -> game path seen by the native compiler.
++to_guest() {
++    local p=$1
++    case "$p" in "$USERDIR"/*) echo "$GAME/${p#"$USERDIR"/}" ;; *) echo "$p" ;; esac
++}
++
++run_native() {  # program, args...
++    local program=$1; shift
++    exec /usr/bin/arch -arm64 "$NATIVE" "${FIXED[@]}" --program "$program" -- "$@"
++}
++
++if [ "$MODE" = original ]; then
++    args=(); for a in "$@"; do args+=("$(to_guest "$a")"); done
++    run_native "$PROGRAM" "${args[@]}"
++fi
++
++BIN="$GAME/bin"
++bee_ready() { [ -x "$BIN/vbsp_osx" ] && [ -x "$BIN/vrad_osx" ] && [ -f "$BIN/bee2/vbsp_config.cfg" ]; }
++
++case "$PROGRAM" in
++    vbsp_linux|vrad_dll.so)
++        if ! bee_ready; then log "no BEEmod export: native compiler only"; run_native "$PROGRAM" "$@"; fi
++        # BEEmod calls back <cwd>/<tool>_osx_original: this script.
++        for tool in vbsp vrad; do
++            ln -sf "$0" "$BIN/${tool}_osx_original"
++        done
++        # Valve's VBSP looks for instances under maps/styled/instances (Mac/Linux bug).
++        mkdir -p "$GAME/sdk_content/maps/styled"
++        # BEEmod's VRAD reads ../portal2/puzzles and ../portal2/screenshots from bin/;
++        # the game writes them in the user layer.
++        for sub in puzzles screenshots; do
++            mkdir -p "$USERDIR/portal2/$sub"
++            [ -e "$GAME/portal2/$sub" ] || [ -L "$GAME/portal2/$sub" ] || ln -s "$USERDIR/portal2/$sub" "$GAME/portal2/$sub"
++        done
++        # Only the last argument (the map) is translated; -game keeps the Steam data.
++        args=("$@")
++        last=$((${#args[@]} - 1))
++        args[$last]=$(to_host "${args[$last]}")
++        [ "$PROGRAM" = vbsp_linux ] && bee=vbsp_osx || bee=vrad_osx
++        log "BEEmod $bee: $(printf '%q ' "${args[@]}")"
++        cd "$BIN" || exit 1
++        "$BIN/$bee" "${args[@]}" 2> >(tee -a "$LOG" >&2)
++        status=$?
++        log "BEEmod $bee exited ($status)"
++        exit $status
++        ;;
++    *)
++        run_native "$PROGRAM" "$@"
++        ;;
++esac
+diff --git a/tools/make_app.py b/tools/make_app.py
+index 687316c..16d3cdc 100644
+--- a/tools/make_app.py
++++ b/tools/make_app.py
+@@ -39,6 +39,14 @@ ROOT = Path(__file__).resolve().parent.parent
+ SUPPORT = localconfig.SUPPORT
+ OLD_USER_DIR = '../work/portal2-userdata'  # ancien défaut, relatif au dépôt
+ 
++MAP_COMPILER_HOOK = '''# Compilateur de cartes personnalisé facultatif (BEEmod...) : il reçoit les
++# arguments du compilateur natif, dont le chemin est dans P2_NATIVE_MAP_COMPILER.
++MAP_COMPILER_HOOK={hook}
++if [ -z "$P2_MAP_COMPILER" ] && [ -x "$MAP_COMPILER_HOOK" ]; then
++    export P2_MAP_COMPILER="$MAP_COMPILER_HOOK" P2_NATIVE_MAP_COMPILER="$HERE/portal2-map-compiler"
++fi
++'''
++
+ LAUNCHER = '''#!/bin/bash
+ # Lanceur généré par tools/make_app.py : le modifier là-bas.
+ LOG="$HOME/Library/Logs/{log_name}"
+@@ -71,7 +79,7 @@ if ! /usr/bin/pgrep -qx steam_osx; then
+     sleep 5
+ fi
+ export SteamAppId={appid} SteamGameId={appid}
+-# libsteam_api.dylib de Valve, copiée dans l'app : le runtime la cherche sinon
++{map_compiler_hook}# libsteam_api.dylib de Valve, copiée dans l'app : le runtime la cherche sinon
+ # à côté du dépôt, absent ici.
+ export P2_STEAM_API_DYLIB="$HERE/../Frameworks/libsteam_api.dylib"
+ # Configuration Fontconfig embarquée (sinon cherchée dans le préfixe de compilation).
+@@ -281,9 +289,13 @@ def build_app(app, binary, prep, config, paths, game_args, *, map_compiler=True)
+     if game['name'] == 'portal2':
+         shutil.copy(ROOT / 'tools/puzzlemaker.py', resources / 'puzzlemaker.py')
+     launcher = macos / 'launcher'
++    # Puzzle Maker only: an optional executable next to the user data replaces
++    # the map compiler (docs/puzzlemaker.md#custom-map-compiler-hook).
++    hook = (MAP_COMPILER_HOOK.format(hook=shlex.quote(str(Path(paths['user_dir']).parent / 'map-compiler-hook')))
++            if game['name'] == 'portal2' else '')
+     launcher.write_text(LAUNCHER.format(
+         name=game['app_name'], log_name=game['log_name'], appid=int(game['steam_appid']), executable=game['executable'],
+-        game_args=shlex.join(game_args or default_args(game)),
++        game_args=shlex.join(game_args or default_args(game)), map_compiler_hook=hook,
+         **{key: shlex.quote(str(value)) for key, value in paths.items()}))
+     launcher.chmod(launcher.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+     bundle_libraries(app, binary, localconfig.host_prefix(config), executable=game['executable'])
+diff --git a/tools/puzzlemaker.py b/tools/puzzlemaker.py
+index d0971be..82fa9f3 100644
+--- a/tools/puzzlemaker.py
++++ b/tools/puzzlemaker.py
+@@ -6,6 +6,26 @@ import re
+ import tempfile
+ 
+ 
++def anchor_relative_game_paths(data, game_dir):
++    """Rewrite plain relative search paths (Game "BEE2", added by BEEmod) to
++    |gameinfo_path|../NAME. Source resolves them from the executable's
++    directory, which is bin/ here, not the game root; and on a
++    case-insensitive disk bin/BEE2 is BEEmod's own bin/bee2 config folder."""
++    pattern = re.compile(rb'(?im)^([ \t]*"?Game"?[ \t]+)"?([A-Za-z0-9_\-. ]+?)"?[ \t]*$')
++
++    def fix(match):
++        name = match[2].decode('utf-8', 'replace')
++        if not name.strip():
++            return match[0]
++        existing = {p.name.casefold(): p.name for p in game_dir.iterdir() if p.is_dir()}
++        real = existing.get(name.casefold())
++        if real is None:
++            return match[0]
++        return match[1] + b'|gameinfo_path|../' + real.encode()
++
++    return pattern.sub(fix, data)
++
++
+ def prepare_puzzlemaker(game_dir, user_dir):
+     # CBaseFileSystem rejects absolute writes outside its search paths before
+     # calling fopen. The editor exports into sdk_content, a sibling of portal2.
+@@ -23,6 +43,7 @@ def prepare_puzzlemaker(game_dir, user_dir):
+         newline = b'\r\n' if b'\r\n' in data else b'\n'
+         entry = newline + search[1] + b'\tSDKCONTENT\t\t|gameinfo_path|../sdk_content'
+         data = data[:search.end()] + entry + data[search.end():]
++    data = anchor_relative_game_paths(data, Path(game_dir))
+     target.parent.mkdir(parents=True, exist_ok=True)
+     if not target.exists() or target.read_bytes() != data:
+         out = tempfile.NamedTemporaryFile(dir=target.parent, prefix='.gameinfo.', delete=False)
